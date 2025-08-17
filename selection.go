@@ -163,11 +163,35 @@ func (s *controllingSelector) PingCandidate(local, remote Candidate) {
 }
 
 type controlledSelector struct {
-	agent *Agent
-	log   logging.LeveledLogger
+	agent          *Agent
+	log            logging.LeveledLogger
+	lastNomination *uint32 // For renomination: tracks highest nomination value seen
 }
 
 func (s *controlledSelector) Start() {
+	s.lastNomination = nil
+}
+
+// shouldAcceptNomination checks if a nomination should be accepted based on renomination rules.
+func (s *controlledSelector) shouldAcceptNomination(nominationValue *uint32) bool {
+	// If no nomination value, accept normally (standard ICE nomination)
+	if nominationValue == nil {
+		return true
+	}
+
+	// If nomination value is present, controlling side is using renomination
+	// Apply "last nomination wins" rule
+
+	if s.lastNomination == nil || *nominationValue > *s.lastNomination {
+		s.lastNomination = nominationValue
+		s.log.Tracef("Accepting nomination with value %d", *nominationValue)
+
+		return true
+	}
+
+	s.log.Tracef("Rejecting nomination value %d (current is %d)", *nominationValue, *s.lastNomination)
+
+	return false
 }
 
 func (s *controlledSelector) ContactCandidates() {
@@ -253,6 +277,22 @@ func (s *controlledSelector) HandleBindingRequest(m *stun.Message, local, remote
 	if useCandidate {
 		// https://tools.ietf.org/html/rfc8445#section-7.3.1.5
 
+		// Check for renomination attribute
+		var nominationValue *uint32
+		var nomination NominationAttribute
+		if err := nomination.GetFromWithType(m, s.agent.nominationAttribute); err == nil {
+			nominationValue = &nomination.Value
+			s.log.Tracef("Received nomination with value %d", nomination.Value)
+		}
+
+		// Check if we should accept this nomination based on renomination rules
+		if !s.shouldAcceptNomination(nominationValue) {
+			s.log.Tracef("Rejecting nomination request due to renomination rules")
+			s.agent.sendBindingSuccess(m, local, remote)
+
+			return
+		}
+
 		if p.state == CandidatePairStateSucceeded {
 			// If the state of this pair is Succeeded, it means that the check
 			// previously sent by this pair produced a successful response and
@@ -260,6 +300,7 @@ func (s *controlledSelector) HandleBindingRequest(m *stun.Message, local, remote
 			// nominated flag value of the valid pair to true.
 			if selectedPair := s.agent.getSelectedPair(); selectedPair == nil ||
 				(selectedPair != p && selectedPair.priority() <= p.priority()) {
+				s.log.Tracef("Accepting nomination for pair %s", p)
 				s.agent.setSelectedPair(p)
 			} else if selectedPair != p {
 				s.log.Tracef("Ignore nominate new pair %s, already nominated pair %s", p, selectedPair)
@@ -273,7 +314,7 @@ func (s *controlledSelector) HandleBindingRequest(m *stun.Message, local, remote
 			// MUST remove the candidate pair from the valid list, set the
 			// candidate pair state to Failed, and set the checklist state to
 			// Failed.
-			p.nominateOnBindingSuccess = true
+			// p.nominateOnBindingSuccess = true
 		}
 	}
 

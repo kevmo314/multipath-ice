@@ -147,6 +147,11 @@ type Agent struct {
 	insecureSkipVerify bool
 
 	proxyDialer proxy.Dialer
+
+	// Renomination support
+	enableRenomination       bool
+	nominationValueGenerator func() uint32
+	nominationAttribute      stun.AttrType
 }
 
 type task struct {
@@ -321,6 +326,10 @@ func NewAgent(config *AgentConfig) (*Agent, error) { //nolint:gocognit
 		includeLoopback: config.IncludeLoopback,
 
 		disableActiveTCP: config.DisableActiveTCP,
+
+		enableRenomination:       true,
+		nominationValueGenerator: DefaultNominationValueGenerator(),
+		nominationAttribute:      stun.AttrType(0x0030), // Default value
 	}
 
 	if a.net == nil {
@@ -1177,6 +1186,23 @@ func (a *Agent) GetSelectedCandidatePair() (*CandidatePair, error) {
 	return &CandidatePair{Local: local, Remote: remote}, nil
 }
 
+// GetSucceededCandidatePairs returns a list of all the pairs that have been successfully
+// connected
+func (a *Agent) GetSucceededCandidatePairs() ([]*CandidatePair, error) {
+	pairs := make([]*CandidatePair, 0)
+	if err := a.run(a.context(), func(ctx context.Context, a *Agent) {
+		for _, pair := range a.checklist {
+			if pair.state == CandidatePairStateSucceeded {
+				pairs = append(pairs, pair)
+			}
+		}
+	}); err != nil {
+		return nil, err
+	}
+
+	return pairs, nil
+}
+
 func (a *Agent) getSelectedPair() *CandidatePair {
 	if selectedPair, ok := a.selectedPair.Load().(*CandidatePair); ok {
 		return selectedPair
@@ -1284,5 +1310,67 @@ func (a *Agent) setGatheringState(newState GatheringState) error {
 	}
 
 	<-done
+	return nil
+}
+
+// getNominationValue returns a nomination value if generator is available, otherwise 0.
+func (a *Agent) getNominationValue() uint32 {
+	if a.nominationValueGenerator != nil {
+		return a.nominationValueGenerator()
+	}
+
+	return 0
+}
+
+// RenominateCandidate allows the controlling ICE agent to nominate a new candidate pair.
+// This implements the continuous renomination feature from draft-thatcher-ice-renomination-01.
+func (a *Agent) RenominateCandidate(local, remote Candidate) error {
+	if !a.isControlling {
+		return ErrOnlyControllingAgentCanRenominate
+	}
+
+	if !a.enableRenomination {
+		return ErrRenominationNotEnabled
+	}
+
+	// Find the candidate pair
+	pair := a.findPair(local, remote)
+	if pair == nil {
+		return ErrCandidatePairNotFound
+	}
+
+	// Send nomination with custom attribute
+	return a.sendNominationRequest(pair, a.getNominationValue())
+}
+
+// sendNominationRequest sends a nomination request with custom nomination value.
+func (a *Agent) sendNominationRequest(pair *CandidatePair, nominationValue uint32) error {
+	attributes := []stun.Setter{
+		stun.TransactionID,
+		stun.NewUsername(a.remoteUfrag + ":" + a.localUfrag),
+		UseCandidate(),
+		AttrControlling(a.tieBreaker),
+		PriorityAttr(pair.Local.Priority()),
+		stun.NewShortTermIntegrity(a.remotePwd),
+		stun.Fingerprint,
+	}
+
+	// Add nomination attribute if renomination is enabled and value > 0
+	if a.enableRenomination && nominationValue > 0 {
+		attributes = append(attributes, NominationSetter{
+			Value:    nominationValue,
+			AttrType: a.nominationAttribute,
+		})
+		a.log.Tracef("Sending renomination request from %s to %s with nomination value %d",
+			pair.Local, pair.Remote, nominationValue)
+	}
+
+	msg, err := stun.Build(append([]stun.Setter{stun.BindingRequest}, attributes...)...)
+	if err != nil {
+		return fmt.Errorf("failed to build nomination request: %w", err)
+	}
+
+	a.sendBindingRequest(msg, pair.Local, pair.Remote)
+
 	return nil
 }

@@ -5,6 +5,8 @@ package ice
 
 import (
 	"context"
+	"log"
+	"math/rand"
 	"net"
 	"sync/atomic"
 	"time"
@@ -89,18 +91,14 @@ func (c *Conn) Write(p []byte) (int, error) {
 		return 0, errWriteSTUNMessageToIceConn
 	}
 
-	pair := c.agent.getSelectedPair()
-	if pair == nil {
-		if err = c.agent.run(c.agent.context(), func(ctx context.Context, a *Agent) {
-			pair = a.getBestValidCandidatePair()
-		}); err != nil {
-			return 0, err
-		}
-
-		if pair == nil {
-			return 0, err
-		}
+	selected, err := c.agent.GetSucceededCandidatePairs()
+	if err != nil || len(selected) == 0 {
+		return 0, err
 	}
+
+	pair := selected[rand.Intn(len(selected))]
+
+	log.Printf("using pair: %v", pair)
 
 	atomic.AddUint64(&c.bytesSent, uint64(len(p)))
 	return pair.Write(p)
